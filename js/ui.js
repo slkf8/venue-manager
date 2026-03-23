@@ -34,8 +34,13 @@ const UI = (() => {
     sheet.id = id;
     sheet.className = 'bottom-sheet' + (opts.tall ? ' tall' : '');
     sheet.innerHTML = `
-      <div class="sheet-handle"></div>
-      ${opts.title ? `<div class="sheet-title">${opts.title}</div>` : ''}
+      <div class="sheet-header">
+        <div class="sheet-handle"></div>
+        <div class="sheet-header-row">
+          ${opts.title ? `<div class="sheet-title">${opts.title}</div>` : '<div></div>'}
+          <button class="sheet-close-btn" onclick="UI.closeSheet('${id}')" aria-label="關閉">✕</button>
+        </div>
+      </div>
       <div class="sheet-body">${contentHTML}</div>
     `;
     document.body.appendChild(sheet);
