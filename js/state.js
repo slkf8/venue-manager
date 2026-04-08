@@ -170,6 +170,7 @@ const State = (() => {
   // ── EQUIPMENT SNAPSHOT ────────────────────────────────────────────────────
   async function updateEquipStatus(equipId, status, note) {
     let snap = data.todayESnap[equipId];
+    const prevStatus = snap ? snap.status : null;
     if (snap) {
       snap.status = status;
       if (note !== null) snap.note = note;
@@ -185,6 +186,16 @@ const State = (() => {
     await Storage.put(Storage.S.ESNAP, snap);
     data.todayESnap[equipId] = snap;
     await _log(`設備狀態更新：${_equipName(equipId)} → ${status}`);
+
+    // Auto-resolve latest active issue when status transitions to 正常
+    if (prevStatus && prevStatus !== '正常' && status === '正常') {
+      const latestIssue = data.activeIssues
+        .filter(i => i.equipmentId === equipId)
+        .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))[0] || null;
+      if (latestIssue) {
+        await resolveIssue(latestIssue.id);
+      }
+    }
   }
 
   // ── SUPPLY SNAPSHOT ───────────────────────────────────────────────────────
