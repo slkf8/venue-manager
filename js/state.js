@@ -99,20 +99,12 @@ const State = (() => {
     if (todayRecs.length) {
       data.todayRecord = todayRecs[0];
     } else {
-      data.todayRecord = {
-        id                 : Utils.genId(),
-        date               : data.today,
-        checkinDone        : false,
-        checkinTime        : null,
-        headcountExpected  : data.settings.globalHeadcountBase,
-        headcountActual    : null,
-        headcountMissing   : null,
-        headcountNote      : '',
-      };
+      data.todayRecord = await _buildTodayDailyRecordFromLatest();
       await Storage.put(Storage.S.DAILY, data.todayRecord);
     }
 
-    // 6. Today's snapshots + issues
+    // 6. Seed today's snapshots from latest previous data, then load
+    await _seedTodaySnapshotsFromLatest();
     await _loadSnapshots();
     await _loadIssues();
   }
@@ -139,6 +131,31 @@ const State = (() => {
     const all = await Storage.getAll(Storage.S.ISSUES);
     data.activeIssues   = all.filter(i => !i.isArchived);
     data.archivedIssues = all.filter(i =>  i.isArchived);
+  }
+
+  // ── ENSURE DAILY RECORD AT DATE ───────────────────────────────────────────
+  async function ensureDailyRecordAtDate(date) {
+    const recs = await Storage.getAllByIndex(Storage.S.DAILY, 'date', date);
+    if (recs.length) return recs[0];
+
+    const rec = {
+      id                : Utils.genId(),
+      date,
+      checkinDone       : false,
+      checkinTime       : null,
+      headcountExpected : data.settings.globalHeadcountBase,
+      headcountActual   : null,
+      headcountMissing  : null,
+      headcountNote     : '',
+    };
+
+    await Storage.put(Storage.S.DAILY, rec);
+
+    if (date === data.today) {
+      data.todayRecord = rec;
+    }
+
+    return rec;
   }
 
   // ── CHECKIN ───────────────────────────────────────────────────────────────
@@ -187,6 +204,59 @@ const State = (() => {
     }
     await Storage.put(Storage.S.SSNAP, snap);
     data.todaySSnap[supplyId] = snap;
+  }
+
+  // ── HISTORY SNAPSHOT UPSERT (single-date only; no future propagation) ─────
+  async function upsertEquipSnapAtDate(date, equipId, status, note) {
+    const snapsForDate = await Storage.getAllByIndex(Storage.S.ESNAP, 'date', date);
+    let snap = snapsForDate.find(s => s.equipmentId === equipId) || null;
+
+    if (snap) {
+      snap.status = status;
+      if (note !== undefined) snap.note = note;
+    } else {
+      snap = {
+        id          : Utils.genId(),
+        equipmentId : equipId,
+        date,
+        status,
+        note        : note !== undefined ? note : '',
+      };
+    }
+
+    await Storage.put(Storage.S.ESNAP, snap);
+
+    if (date === data.today) {
+      data.todayESnap[equipId] = snap;
+    }
+
+    return snap;
+  }
+
+  async function upsertSupplySnapAtDate(date, supplyId, qty, status) {
+    const snapsForDate = await Storage.getAllByIndex(Storage.S.SSNAP, 'date', date);
+    let snap = snapsForDate.find(s => s.supplyId === supplyId) || null;
+
+    if (snap) {
+      if (qty    !== null) snap.quantity = qty;
+      if (status !== null) snap.status   = status;
+    } else {
+      snap = {
+        id       : Utils.genId(),
+        supplyId,
+        date,
+        quantity : qty,
+        status   : status || '正常',
+      };
+    }
+
+    await Storage.put(Storage.S.SSNAP, snap);
+
+    if (date === data.today) {
+      data.todaySSnap[supplyId] = snap;
+    }
+
+    return snap;
   }
 
   // ── ISSUES ────────────────────────────────────────────────────────────────
@@ -356,6 +426,8 @@ const State = (() => {
   }
 
   // ── CASCADE (history edits propagate to subsequent snapshots) ─────────────
+  // Temporary keep for compatibility until history.js is switched to the new
+  // single-date upsert APIs.
   async function cascadeEquipSnap(date, equipId, status, note) {
     const all      = await Storage.getAll(Storage.S.ESNAP);
     const affected = all.filter(s => s.equipmentId === equipId && s.date >= date);
@@ -394,6 +466,89 @@ const State = (() => {
     if (data.today >= date) await _loadSnapshots();
   }
 
+  // ── SEED TODAY FROM LATEST PREVIOUS SNAPSHOT ──────────────────────────────
+  async function _seedTodaySnapshotsFromLatest() {
+    // Today's existing equipment snapshots
+    const todayESnaps = await Storage.getAllByIndex(Storage.S.ESNAP, 'date', data.today);
+    const todayEquipMap = {};
+    todayESnaps.forEach(s => { todayEquipMap[s.equipmentId] = true; });
+
+    // Today's existing supply snapshots
+    const todaySSnaps = await Storage.getAllByIndex(Storage.S.SSNAP, 'date', data.today);
+    const todaySupplyMap = {};
+    todaySSnaps.forEach(s => { todaySupplyMap[s.supplyId] = true; });
+
+    // Load all historical snapshots once
+    const allESnaps = await Storage.getAll(Storage.S.ESNAP);
+    const allSSnaps = await Storage.getAll(Storage.S.SSNAP);
+
+    // Seed equipment snapshots for today if missing
+    for (const equip of data.equipment.filter(e => e.isActive)) {
+      if (todayEquipMap[equip.id]) continue;
+
+      const latest = allESnaps
+        .filter(s => s.equipmentId === equip.id && s.date < data.today)
+        .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+      if (!latest) continue;
+
+      const newSnap = {
+        id: Utils.genId(),
+        equipmentId: equip.id,
+        date: data.today,
+        status: latest.status,
+        note: latest.note || '',
+      };
+
+      await Storage.put(Storage.S.ESNAP, newSnap);
+    }
+
+    // Seed supply snapshots for today if missing
+    for (const supply of data.supplies.filter(s => s.isActive)) {
+      if (todaySupplyMap[supply.id]) continue;
+
+      const latest = allSSnaps
+        .filter(s => s.supplyId === supply.id && s.date < data.today)
+        .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+      if (!latest) continue;
+
+      const newSnap = {
+        id: Utils.genId(),
+        supplyId: supply.id,
+        date: data.today,
+        quantity: latest.quantity ?? null,
+        status: latest.status || '正常',
+      };
+
+      await Storage.put(Storage.S.SSNAP, newSnap);
+    }
+  }
+
+  // ── BUILD TODAY DAILY RECORD FROM LATEST ───────────────────────────────────
+  async function _buildTodayDailyRecordFromLatest() {
+    const allDaily = await Storage.getAll(Storage.S.DAILY);
+    const latest = allDaily
+      .filter(r => r.date < data.today)
+      .sort((a, b) => b.date.localeCompare(a.date))[0];
+
+    const expected =
+      latest && latest.headcountExpected !== null && latest.headcountExpected !== undefined
+        ? latest.headcountExpected
+        : data.settings.globalHeadcountBase;
+
+    return {
+      id                 : Utils.genId(),
+      date               : data.today,
+      checkinDone        : false,
+      checkinTime        : null,
+      headcountExpected  : expected,
+      headcountActual    : null,
+      headcountMissing   : null,
+      headcountNote      : '',
+    };
+  }
+
   // ── PRIVATE HELPERS ───────────────────────────────────────────────────────
   function _equipName(id) {
     const e = data.equipment.find(x => x.id === id);
@@ -410,6 +565,17 @@ const State = (() => {
     await Storage.put(Storage.S.LOGS, entry);
   }
 
+  async function addLogAtDate(date, message) {
+    const entry = {
+      id        : Utils.genId(),
+      date,
+      message,
+      createdAt : Utils.nowISO(),
+    };
+    await Storage.put(Storage.S.LOGS, entry);
+    return entry;
+  }
+
   // ── PUBLIC API ────────────────────────────────────────────────────────────
   return {
     data,
@@ -418,6 +584,8 @@ const State = (() => {
     doCheckin,
     updateEquipStatus,
     updateSupplySnap,
+    upsertEquipSnapAtDate,
+    upsertSupplySnapAtDate,
     addIssue,
     updateIssue,
     resolveIssue,
@@ -427,5 +595,7 @@ const State = (() => {
     updateBaseHeadcount,
     cascadeEquipSnap,
     cascadeSupplySnap,
+    ensureDailyRecordAtDate,
+    addLogAtDate,
   };
 })();
